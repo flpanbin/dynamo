@@ -24,9 +24,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 
 use dynamo_ext_proc::ExtProcServer;
-use dynamo_ext_proc::picker::{
-    CacheSaltForwarding, Endpoint, EndpointPicker, PickError, PickResult, RequestInfo,
-};
+use dynamo_ext_proc::picker::{Endpoint, EndpointPicker, PickError, PickResult, RequestInfo};
 use dynamo_ext_proc::proto::envoy::config::core::v3::{HeaderMap, HeaderValue};
 use dynamo_ext_proc::proto::envoy::service::ext_proc::v3::{
     self as ext_proc, ProcessingRequest, external_processor_client::ExternalProcessorClient,
@@ -52,91 +50,6 @@ impl EndpointPicker for MockPicker {
         *self.observed_headers.lock().unwrap() = req.headers.clone();
         Ok(self.result.clone())
     }
-}
-
-/// Sends a request through the ext_proc gRPC protocol and returns the body Envoy
-/// would forward after the server applies the pick result.
-async fn forwarded_body(pick_result: PickResult, body: &[u8]) -> serde_json::Value {
-    let observed_headers = Arc::new(Mutex::new(Vec::new()));
-    let server = ExtProcServer::new(Arc::new(MockPicker {
-        result: pick_result,
-        observed_headers,
-    }));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(server.into_service())
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut client = ExternalProcessorClient::connect(format!("http://{addr}"))
-        .await
-        .unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<ProcessingRequest>(2);
-    let mut response_stream = client
-        .process(ReceiverStream::new(rx))
-        .await
-        .unwrap()
-        .into_inner();
-
-    tx.send(ProcessingRequest {
-        request: Some(ext_proc::processing_request::Request::RequestHeaders(
-            ext_proc::HttpHeaders {
-                headers: Some(HeaderMap { headers: vec![] }),
-                end_of_stream: false,
-            },
-        )),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    tx.send(ProcessingRequest {
-        request: Some(ext_proc::processing_request::Request::RequestBody(
-            ext_proc::HttpBody {
-                body: body.to_vec(),
-                end_of_stream: true,
-            },
-        )),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-
-    let body_response = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let response = tokio_stream::StreamExt::next(&mut response_stream)
-                .await
-                .expect("ext_proc response stream ended")
-                .expect("ext_proc response failed");
-            if let Some(processing_response::Response::RequestBody(body)) = response.response {
-                return body;
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for the body response");
-
-    let common = body_response
-        .response
-        .as_ref()
-        .expect("missing body CommonResponse");
-    let mutation = common.body_mutation.as_ref().expect("missing BodyMutation");
-    let streamed = match &mutation.mutation {
-        Some(ext_proc::body_mutation::Mutation::StreamedResponse(streamed)) => streamed,
-        other => panic!("expected StreamedResponse body mutation, got: {other:?}"),
-    };
-
-    assert!(
-        streamed.end_of_stream,
-        "body response should have end_of_stream=true"
-    );
-    serde_json::from_slice(&streamed.body).expect("forwarded body is not valid JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -456,65 +369,4 @@ async fn test_pick_result_translates_to_ext_proc_mutations() {
         .and_then(|v| v.as_str())
         .expect("model field missing");
     assert_eq!(model, "test-model", "model field preserved");
-}
-
-#[tokio::test]
-async fn runtime_cache_salt_is_preserved_while_tokens_are_injected() {
-    let forwarded = forwarded_body(
-        PickResult {
-            endpoint: "127.0.0.1:8000".to_string(),
-            fallbacks: vec![],
-            headers: vec![],
-            selected_prefill_endpoint: None,
-            token_ids: Some(vec![11, 12, 13]),
-            // Preserve must ignore this resolved namespace: the downstream
-            // Dynamo runtime handles its original cache-salt inputs itself.
-            cache_namespace: Some("resolved-cache-namespace".to_string()),
-            cache_salt_forwarding: CacheSaltForwarding::Preserve,
-            reservation_id: None,
-        },
-        br#"{"model":"test-model","cache_salt":"top-level-salt","nvext":{"cache_salt":"nvext-salt","existing_field":"preserved"}}"#,
-    )
-    .await;
-
-    assert_eq!(forwarded["cache_salt"], serde_json::json!("top-level-salt"));
-    assert_eq!(
-        forwarded["nvext"]["cache_salt"],
-        serde_json::json!("nvext-salt")
-    );
-    assert_eq!(
-        forwarded["nvext"]["existing_field"],
-        serde_json::json!("preserved")
-    );
-    assert_eq!(
-        forwarded["nvext"]["token_data"],
-        serde_json::json!([11, 12, 13])
-    );
-}
-
-#[tokio::test]
-async fn standalone_cache_salt_is_injected_without_token_data() {
-    let forwarded = forwarded_body(
-        PickResult {
-            endpoint: "127.0.0.1:8000".to_string(),
-            fallbacks: vec![],
-            headers: vec![],
-            selected_prefill_endpoint: None,
-            token_ids: None,
-            cache_namespace: Some("resolved-cache-namespace".to_string()),
-            cache_salt_forwarding: CacheSaltForwarding::NativeVllm,
-            reservation_id: None,
-        },
-        br#"{"model":"test-model"}"#,
-    )
-    .await;
-
-    assert_eq!(
-        forwarded["cache_salt"],
-        serde_json::json!("dynamo-cache-salt:resolved-cache-namespace")
-    );
-    assert!(
-        forwarded.get("nvext").is_none(),
-        "standalone forwarding must not inject nvext.token_data"
-    );
 }

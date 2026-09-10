@@ -73,9 +73,19 @@ impl RenderClient {
     }
 }
 
+fn cache_salt_forwarding_for_renderer(renderer_protocol: RendererProtocol) -> CacheSaltForwarding {
+    match renderer_protocol {
+        RendererProtocol::VllmRender => CacheSaltForwarding::NativeVllm,
+        // SGLang cache salting is not supported end to end yet: do not send
+        // vLLM's request extension to an SGLang worker.
+        RendererProtocol::SglangRenderer => CacheSaltForwarding::NativeSglang,
+    }
+}
+
 /// Standalone endpoint picker backed by the standalone selection service.
 pub struct EppRouter {
     renderer: RenderClient,
+    cache_salt_forwarding: CacheSaltForwarding,
     reflector: Arc<PodDiscovery>,
     selector: Arc<Selector>,
     // Kept alive for the lifetime of the router; the reconcile loop runs on it.
@@ -109,6 +119,7 @@ impl EppRouter {
         let selector = Arc::new(Selector::new(&cfg, policy_registry).await?);
         let timeout = Duration::from_millis(cfg.tokenization_timeout_ms);
         let max_response_bytes = cfg.tokenizer_max_response_bytes;
+        let cache_salt_forwarding = cache_salt_forwarding_for_renderer(cfg.renderer_protocol);
         let renderer = match cfg.renderer_protocol {
             RendererProtocol::VllmRender => RenderClient::Vllm(VllmRenderClient::new(
                 &cfg.tokenizer_service_url,
@@ -132,6 +143,7 @@ impl EppRouter {
         // ready immediately and returns 503 per-request until capacity appears.
         Ok(Self {
             renderer,
+            cache_salt_forwarding,
             reflector,
             selector,
             _adapter: adapter,
@@ -409,8 +421,7 @@ impl EndpointPicker for EppRouter {
             // Worker re-tokenizes the forwarded request (llm-d parity); no inject.
             token_ids: None,
             cache_namespace,
-            // Native vLLM has no Dynamo handler to tag the salt; the EPP does.
-            cache_salt_forwarding: CacheSaltForwarding::NativeVllm,
+            cache_salt_forwarding: self.cache_salt_forwarding,
             // Booking id for the server's lifecycle callbacks (no shared map).
             reservation_id: Some(reservation_id),
             ..Default::default()
@@ -571,6 +582,18 @@ mod tests {
         // No metadata header → no policy class.
         let headers: Vec<(String, String)> = vec![("x-request-id".to_string(), "r1".to_string())];
         assert_eq!(requested_policy_class(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn cache_salt_forwarding_follows_renderer_protocol() {
+        assert_eq!(
+            cache_salt_forwarding_for_renderer(RendererProtocol::VllmRender),
+            CacheSaltForwarding::NativeVllm
+        );
+        assert_eq!(
+            cache_salt_forwarding_for_renderer(RendererProtocol::SglangRenderer),
+            CacheSaltForwarding::NativeSglang
+        );
     }
 
     #[test]

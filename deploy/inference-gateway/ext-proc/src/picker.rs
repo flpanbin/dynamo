@@ -65,6 +65,9 @@ pub enum CacheSaltForwarding {
     /// Raw native vLLM has no Dynamo code in the request path to add the
     /// marker, so the EPP must add it.
     NativeVllm,
+    /// Raw SGLang has no compatible cache-salt request/KV-event contract yet.
+    /// Keep the namespace in selection only; do not inject it into the body.
+    NativeSglang,
 }
 
 /// The endpoint selection result, with the Dynamo-specific routing headers

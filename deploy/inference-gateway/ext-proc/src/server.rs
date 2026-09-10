@@ -331,12 +331,13 @@ impl<P: EndpointPicker> ExtProcServer<P> {
         // Inject routing extensions into the request body JSON.
         // `nvext.token_data` lets the backend skip redundant tokenization.
         // `cache_salt` is written only under the `NativeVllm` forwarding
-        // policy (see `CacheSaltForwarding`); `Preserve` leaves the body
-        // untouched. Only the injection path allocates a new body — otherwise
+        // policy (see `CacheSaltForwarding`); `Preserve` and `NativeSglang`
+        // leave it untouched. Only the injection path allocates a new body -
+        // otherwise
         // the unchanged body is a cheap `Bytes` clone (no copy).
         let cache_salt = match result.cache_salt_forwarding {
             CacheSaltForwarding::NativeVllm => result.cache_namespace.as_deref(),
-            CacheSaltForwarding::Preserve => None,
+            CacheSaltForwarding::Preserve | CacheSaltForwarding::NativeSglang => None,
         };
         let forwarded_body: Bytes = if result.token_ids.is_some() || cache_salt.is_some() {
             match inject_body_extensions(&raw_body, result.token_ids.as_deref(), cache_salt) {

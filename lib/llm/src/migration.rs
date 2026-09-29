@@ -25,6 +25,7 @@ use crate::{
 };
 
 use dynamo_kv_router::scheduling::AbortCause;
+use dynamo_protocols::types::CompletionUsage;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
@@ -45,6 +46,10 @@ pub(crate) trait HasTokenIds {
     fn token_ids(&self) -> &[TokenIdType];
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink>;
     fn jailed_text(&self) -> Option<&str>;
+    /// Backend-reported usage for the chunk. Mutable so the RetryManager can
+    /// correct `prompt_tokens` for replayed tokens before the chunk reaches
+    /// the client-facing usage aggregator.
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage>;
 }
 
 impl HasTokenIds for BackendOutput {
@@ -57,6 +62,9 @@ impl HasTokenIds for BackendOutput {
     fn jailed_text(&self) -> Option<&str> {
         self.jailed_text.as_deref()
     }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
+    }
 }
 
 impl HasTokenIds for LLMEngineOutput {
@@ -68,6 +76,9 @@ impl HasTokenIds for LLMEngineOutput {
     }
     fn jailed_text(&self) -> Option<&str> {
         self.jailed_text.as_deref()
+    }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
     }
 }
 
@@ -327,6 +338,12 @@ where
     next_attempt: u32,
     /// Number of generated tokens delivered before the next migration.
     completed_tokens: usize,
+    /// Tokens from earlier attempts that were replayed onto `request.token_ids`
+    /// so a migration retry could continue generation. The retried worker counts
+    /// them as prompt tokens, so they must be subtracted from the backend-reported
+    /// `prompt_tokens` to keep client-facing usage from double-counting generated
+    /// tokens (they are also accumulated into `completion_tokens`).
+    replayed_tokens: u32,
     /// Failure that caused the next physical dispatch to be a migration retry.
     pending_migration: Option<MigrationCause>,
 }
@@ -411,6 +428,7 @@ where
             active_route_trace: None,
             next_attempt: 0,
             completed_tokens: 0,
+            replayed_tokens: 0,
             pending_migration: None,
         };
         slf.new_stream(None).await?;
@@ -427,7 +445,7 @@ where
                     return Some(Annotated::from_error("next_stream is None"));
                 }
             };
-            if let Some(response) = response_stream.next().await {
+            if let Some(mut response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref() {
                     if is_migratable_for_request(&self.request, err) {
@@ -476,7 +494,7 @@ where
                         self.abort_request_lifecycle(err);
                     }
                 }
-                self.track_response(&response);
+                self.track_response(&mut response);
                 return Some(response);
             }
             return None;
@@ -705,11 +723,23 @@ where
         }
     }
 
-    fn track_response(&mut self, response: &Annotated<Resp>) {
-        let llm_engine_output = match response.data.as_ref() {
+    fn track_response(&mut self, response: &mut Annotated<Resp>) {
+        let llm_engine_output = match response.data.as_mut() {
             Some(output) => output,
             None => return,
         };
+        // Correct the backend-reported usage for replayed tokens. A migration
+        // retry sends the retried worker a prompt that includes every token
+        // already generated on earlier attempts, so the worker's
+        // `prompt_tokens` counts them even though they were already delivered
+        // as completion output. The frontend's usage aggregator adopts this
+        // number verbatim, which would bill the same tokens twice. Subtract
+        // the replayed total so client-facing `prompt_tokens` reflects the
+        // original prompt. Runs on every attempt, including the final one,
+        // and before the replayed counter below absorbs this chunk.
+        if let Some(usage) = llm_engine_output.completion_usage_mut() {
+            usage.prompt_tokens = usage.prompt_tokens.saturating_sub(self.replayed_tokens);
+        }
         let token_ids = llm_engine_output.token_ids();
         // Pure telemetry for the migration lifecycle events, so it has to count
         // the final allowed attempt as well. `new_stream` decrements
@@ -750,6 +780,7 @@ where
             self.request.stop_conditions.min_tokens = Some(min_tokens.saturating_sub(output_len));
         }
         if !token_ids.is_empty() {
+            self.replayed_tokens = self.replayed_tokens.saturating_add(output_len);
             Arc::make_mut(&mut self.request.token_ids).extend(token_ids.iter().copied());
         }
     }
@@ -2568,7 +2599,8 @@ mod tests {
         .expect("Failed to build RetryManager");
 
         // Metadata-only chunks must not copy the shared prompt.
-        retry_manager.track_response(&Annotated::from_data(LLMEngineOutput::default()));
+        let mut metadata_only = Annotated::from_data(LLMEngineOutput::default());
+        retry_manager.track_response(&mut metadata_only);
         assert!(Arc::ptr_eq(
             &original_request.token_ids,
             &retry_manager.request.token_ids
@@ -2588,6 +2620,135 @@ mod tests {
             &original_request.token_ids,
             &retry_manager.request.token_ids
         ));
+    }
+
+    /// Regression test for the replayed-usage bug: tokens delivered before a
+    /// migration are replayed onto the retried request, so the retried worker
+    /// reports them as part of `prompt_tokens`. The RetryManager must subtract
+    /// the replayed total from backend-reported usage so client-facing
+    /// `prompt_tokens` reflects the original prompt and generated tokens are
+    /// not billed once as prompt and again as completion.
+    #[tokio::test]
+    async fn test_retry_manager_excludes_replayed_tokens_from_prompt_usage() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+
+        let request = create_mock_request(10);
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            mock_engine;
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            1, // migration limit > 0 so replay state is tracked
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics,
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        // Two delivered chunks stand in for the tokens generated before a
+        // migration; they are appended to the replayed request prompt.
+        for token_id in [10, 11] {
+            let mut chunk = create_mock_output(token_id);
+            retry_manager.track_response(&mut chunk);
+        }
+        assert_eq!(
+            retry_manager.request.token_ids.as_slice(),
+            &[1, 2, 3, 10, 11],
+            "replayed tokens must extend the request prompt"
+        );
+
+        // The retried worker sees prompt = original 3 + replayed 2 = 5 and
+        // reports that in its usage. The client-facing value must be corrected
+        // back to the original prompt length.
+        let usage = dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: 5,
+            completion_tokens: 10,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let mut final_chunk = create_mock_output(12);
+        final_chunk.data.as_mut().unwrap().completion_usage = Some(usage);
+        retry_manager.track_response(&mut final_chunk);
+        let corrected = final_chunk
+            .data
+            .as_ref()
+            .unwrap()
+            .completion_usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            corrected.prompt_tokens, 3,
+            "replayed tokens must be subtracted from backend-reported prompt_tokens"
+        );
+
+        // Without any migration the backend-reported prompt passes through
+        // unchanged: nothing was replayed, so nothing is subtracted.
+        let request = create_mock_request(10);
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            mock_engine;
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut no_migration = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics,
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut single_chunk = create_mock_output(20);
+        single_chunk.data.as_mut().unwrap().completion_usage =
+            Some(dynamo_protocols::types::CompletionUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            });
+        no_migration.track_response(&mut single_chunk);
+        assert_eq!(
+            no_migration.request.token_ids.as_slice(),
+            &[1, 2, 3, 20],
+            "non-migrated request still tracks delivered tokens"
+        );
+        assert_eq!(
+            single_chunk
+                .data
+                .as_ref()
+                .unwrap()
+                .completion_usage
+                .as_ref()
+                .unwrap()
+                .prompt_tokens,
+            3,
+            "no subtraction without migration"
+        );
     }
 
     /// Regression test for the migration-discards-withheld-text bug: a chunk delivered

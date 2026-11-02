@@ -73,10 +73,20 @@ pub(crate) fn request_has_multimodal_input(request: &PreprocessedRequest) -> boo
     request_has_raw_media(request) || request_has_preprocessed_media(request)
 }
 
+#[cfg(test)]
 pub(crate) fn build_generate_request(
     request: PreprocessedRequest,
     request_id: String,
     mode: DisaggregationMode,
+) -> Result<pb::GenerateRequest, DynamoError> {
+    build_generate_request_with_handoff(request, request_id, mode, None)
+}
+
+pub(crate) fn build_generate_request_with_handoff(
+    request: PreprocessedRequest,
+    request_id: String,
+    mode: DisaggregationMode,
+    mooncake: Option<&MooncakeHandoff>,
 ) -> Result<pb::GenerateRequest, DynamoError> {
     let mut request = normalize_response_options(request)?;
     validate_request(&request, mode)?;
@@ -226,7 +236,14 @@ pub(crate) fn build_generate_request(
         bad_words_token_ids,
         allowed_token_ids,
     } = take_sampling_extensions(&mut extra_args)?;
-    let kv = build_kv_parameters(extra_args, prefill_result, encoder_result, cache_salt, mode)?;
+    let kv = build_kv_parameters(
+        extra_args,
+        prefill_result,
+        encoder_result,
+        cache_salt,
+        mode,
+        mooncake,
+    )?;
 
     Ok(pb::GenerateRequest {
         request_id,
@@ -1239,12 +1256,70 @@ fn structured_output(
     Ok(values.pop())
 }
 
+/// This worker's resolved Mooncake bootstrap identity.
+///
+/// Mooncake is push-based: vLLM never generates a transfer_id and never
+/// returns `kv_transfer_params` from a producer's terminal response, so the
+/// routing layer (here, the sidecar) allocates the transfer_id per request
+/// and publishes the decode-side handoff itself.
+#[derive(Clone, Debug)]
+pub(crate) struct MooncakeBootstrap {
+    /// Address the decode worker queries for this worker's bootstrap server,
+    /// e.g. `http://10.0.0.1:8998`.
+    pub remote_bootstrap_addr: String,
+    /// The engine's Mooncake engine_id, read from its local bootstrap server.
+    pub engine_id: String,
+}
+
+impl MooncakeBootstrap {
+    /// Per-request Mooncake state: a fresh transfer_id bound to this worker.
+    pub(crate) fn new_handoff(&self) -> MooncakeHandoff {
+        MooncakeHandoff {
+            transfer_id: uuid::Uuid::new_v4().to_string(),
+            remote_bootstrap_addr: self.remote_bootstrap_addr.clone(),
+            remote_engine_id: self.engine_id.clone(),
+        }
+    }
+}
+
+/// One prefill request's Mooncake handoff, threaded from request build to the
+/// terminal response so both carry the same transfer_id.
+#[derive(Clone, Debug)]
+pub(crate) struct MooncakeHandoff {
+    transfer_id: String,
+    remote_bootstrap_addr: String,
+    remote_engine_id: String,
+}
+
+impl MooncakeHandoff {
+    /// Inject the fields the Mooncake producer requires into the prefill
+    /// request's kv_transfer_params.
+    fn inject_prefill_params(&self, params: &mut serde_json::Map<String, serde_json::Value>) {
+        params.insert("do_remote_prefill".to_string(), false.into());
+        params.insert("transfer_id".to_string(), self.transfer_id.clone().into());
+    }
+
+    /// The decode-side kv_transfer_params the prefill terminal publishes.
+    /// Matches the engine-side contract: decode validates transfer_id,
+    /// remote_bootstrap_addr, and remote_engine_id before pulling KV.
+    fn decode_params(&self) -> serde_json::Value {
+        serde_json::json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": self.transfer_id,
+            "remote_bootstrap_addr": self.remote_bootstrap_addr,
+            "remote_engine_id": self.remote_engine_id,
+        })
+    }
+}
+
 fn build_kv_parameters(
     extra_args: Option<serde_json::Value>,
     prefill_result: Option<PrefillResult>,
     encoder_result: Option<serde_json::Value>,
     cache_salt: Option<String>,
     mode: DisaggregationMode,
+    mooncake: Option<&MooncakeHandoff>,
 ) -> Result<pb::KvCacheParameters, DynamoError> {
     let mut extra = match extra_args {
         None => None,
@@ -1289,6 +1364,9 @@ fn build_kv_parameters(
                 "do_remote_decode".to_string(),
                 serde_json::Value::Bool(true),
             );
+            if let Some(mooncake) = mooncake {
+                mooncake.inject_prefill_params(&mut params);
+            }
             Some(serde_json::Value::Object(params))
         }
         DisaggregationMode::Decode => {
@@ -1442,6 +1520,8 @@ pub(crate) struct ResponseState {
     multimodal_prompt_token_ids: Option<Vec<u32>>,
     completion_tokens: u32,
     mode: DisaggregationMode,
+    /// This request's Mooncake handoff, allocated when the request was built.
+    mooncake: Option<MooncakeHandoff>,
     /// The prefill leg's prefix-cache hit count, when it reported one.
     prefill_cached_tokens: Option<u32>,
     output_logprobs: Option<u32>,
@@ -1462,6 +1542,7 @@ impl ResponseState {
             multimodal_prompt_token_ids: None,
             completion_tokens: 0,
             mode,
+            mooncake: None,
             prefill_cached_tokens: request
                 .prefill_result
                 .as_ref()
@@ -1481,6 +1562,12 @@ impl ResponseState {
                 .clone()
                 .unwrap_or_default(),
         }
+    }
+
+    /// Bind this request's Mooncake handoff (prefill mode only).
+    pub(crate) fn with_mooncake(mut self, handoff: MooncakeHandoff) -> Self {
+        self.mooncake = Some(handoff);
+        self
     }
 
     pub(crate) fn reported_completion_tokens(&self) -> u32 {
@@ -1653,10 +1740,16 @@ impl ResponseState {
             self.attach_prompt_data(&mut mapped);
             return Ok(Some(mapped));
         }
-        mapped.disaggregated_params = finish
-            .kv_transfer_params
-            .map(|value| struct_to_json_v14(value, PEER, KV_TRANSFER_PARAMS))
-            .transpose()?;
+        mapped.disaggregated_params = match &self.mooncake {
+            // A Mooncake producer's terminal never carries kv_transfer_params;
+            // publish the decode-side handoff allocated when the request was
+            // built instead.
+            Some(handoff) if self.mode.is_prefill() => Some(handoff.decode_params()),
+            _ => finish
+                .kv_transfer_params
+                .map(|value| struct_to_json_v14(value, PEER, KV_TRANSFER_PARAMS))
+                .transpose()?,
+        };
         if self.mode.is_prefill() && mapped.disaggregated_params.is_none() {
             return Err(client::protocol_error(
                 "prefill terminal is missing kv_transfer_params",
